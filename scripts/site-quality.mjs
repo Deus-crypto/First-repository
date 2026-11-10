@@ -4,14 +4,10 @@
 // only when the evidence is clear. Truncated or unexpected input yields fewer issues,
 // not more. auditSite(url, fetchImpl) fetches a page and runs analyzeHtml on it.
 
-export const ISSUES = {
-  no_https:     { label: 'Нет HTTPS' },                       // finalUrl protocol is http:
-  no_viewport:  { label: 'Нет мобильной версии' },            // no <meta name="viewport">
-  no_title:     { label: 'Нет заголовка страницы' },          // missing or empty <title>
-  old_markup:   { label: 'Устаревшая вёрстка' },              // at least two legacy signs
-  parked:       { label: 'Домен продаётся или припаркован' }, // parking phrases in visible text
-  builder_stub: { label: 'Сайт-заглушка' },                   // visible text shorter than 200 chars
-};
+// Issue ids and labels live in js/site-issues.js so the browser can use them too.
+import { ISSUES } from '../js/site-issues.js';
+
+export { ISSUES };
 
 const STUB_MIN_TEXT = 200;
 const FETCH_TIMEOUT_MS = 12000;

@@ -22,19 +22,41 @@ const STATUS_LABELS = Object.fromEntries(STATUSES.map((s) => [s.id, s.label]));
 
 const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 
-/** Приводит запись к виду { status, note, updated }; null для некорректной записи. */
+/**
+ * Ссылка на сделанный сайт (портфолио): аккуратный http(s)-адрес либо '' для пустого
+ * или некорректного значения.
+ */
+export function normalizePortfolioUrl(raw) {
+  if (typeof raw !== 'string') return '';
+  const value = raw.trim();
+  if (!value || /\s/.test(value) || !/^https?:\/\//i.test(value)) return '';
+  try {
+    const url = new URL(value);
+    return url.protocol === 'http:' || url.protocol === 'https:' ? url.href : '';
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Приводит запись к виду { status, note, updated } (+ необязательное поле url — ссылка
+ * на сделанный сайт); null для некорректной записи.
+ */
 function normalizeRecord(rec) {
   if (!isPlainObject(rec) || !VALID_STATUSES.has(rec.status)) return null;
-  return {
+  const out = {
     status: rec.status,
     note: typeof rec.note === 'string' ? rec.note : '',
     updated: typeof rec.updated === 'string' ? rec.updated : null,
   };
+  const url = normalizePortfolioUrl(rec.url);
+  if (url) out.url = url;
+  return out;
 }
 
-/** Запись без статуса и заметки не хранится. */
+/** Запись без статуса, заметки и ссылки на работу не хранится. */
 function isEmptyRecord(rec) {
-  return rec.status === 'none' && !rec.note.trim();
+  return rec.status === 'none' && !rec.note.trim() && !rec.url;
 }
 
 /** Время ISO-строки в миллисекундах; -Infinity для отсутствующей или некорректной даты. */
@@ -107,8 +129,9 @@ export function createLeadStore(storage) {
     },
 
     /**
-     * Меняет статус и/или заметку. Пустая запись (статус 'none', заметка без текста) удаляется.
-     * @throws {TypeError} если статус неизвестен
+     * Меняет статус, заметку и/или ссылку на сделанный сайт (url; пустая строка убирает ссылку).
+     * Пустая запись (статус 'none', заметка без текста, ссылки нет) удаляется.
+     * @throws {TypeError} если статус неизвестен или url не является адресом http(s)
      */
     set(id, patch = {}) {
       const data = readAll(store);
@@ -121,6 +144,13 @@ export function createLeadStore(storage) {
       if (!VALID_STATUSES.has(next.status)) {
         throw new TypeError(`Неизвестный статус лида: ${next.status}`);
       }
+      let url = current.url ?? '';
+      if (patch.url !== undefined) {
+        const raw = patch.url === null ? '' : String(patch.url).trim();
+        url = normalizePortfolioUrl(raw);
+        if (raw && !url) throw new TypeError('Ссылка должна начинаться с http:// или https://');
+      }
+      if (url) next.url = url;
       if (isEmptyRecord(next)) {
         delete data[id];
         writeAll(store, data);
@@ -133,7 +163,7 @@ export function createLeadStore(storage) {
       return { ...next };
     },
 
-    /** Копия всех записей вида { [id]: { status, note, updated } }. */
+    /** Копия всех записей вида { [id]: { status, note, updated, url? } }. */
     all() {
       return readAll(store);
     },
@@ -216,7 +246,7 @@ export function createLeadStore(storage) {
 const CSV_HEADER = [
   'Название', 'Категория', 'Сайт (статус)', 'Сайт', 'Соцсети', 'Телефон', 'Email',
   'Адрес', 'Часы работы', 'Сеть', 'Статус лида', 'Заметка', 'Широта', 'Долгота',
-  'Яндекс Карты', 'OSM ID',
+  'Яндекс Карты', 'OSM ID', 'Балл', 'Проблемы сайта',
 ];
 /** Индексы колонок с координатами: их значения не экранируются от формул. */
 const NUMERIC_COLUMNS = new Set([12, 13]);
@@ -235,7 +265,8 @@ function csvField(value, numeric = false) {
 
 /**
  * Экспорт заведений в CSV для Excel (русская локаль): BOM, разделитель ';', CRLF.
- * @param {object[]} places заведения (любые поля могут отсутствовать)
+ * @param {object[]} places заведения (любые поля могут отсутствовать); `score` — балл перспективности,
+ *   `siteIssueLabels` — подписи проблем сайта (массив или строка)
  * @param {ReturnType<typeof createLeadStore>} [leadStore] если передан, добавляются статус лида и заметка
  * @returns {string}
  */
@@ -251,6 +282,7 @@ export function placesToCSV(places = [], leadStore) {
       lead ? STATUS_LABELS[lead.status] ?? '' : '',
       lead ? lead.note : '',
       p.lat, p.lon, yandex, p.id,
+      p.score, Array.isArray(p.siteIssueLabels) ? p.siteIssueLabels.join(', ') : p.siteIssueLabels,
     ];
   });
   const lines = [CSV_HEADER, ...rows].map((cells) =>

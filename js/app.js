@@ -2,10 +2,16 @@
 import { GROUPS, classify, groupById } from './categories.js';
 import { STATUSES, createLeadStore, placesToCSV, buildPitch, downloadText } from './leads.js';
 import { SITE_STATUS, siteStatus, buildQuery, fetchOverpass, normalizeResponse, hostOf } from './osm.js';
+import { leadScore, LEVELS } from './score.js';
+import { isNew } from './history.js';
+import { ISSUES, knownIssues } from './site-issues.js';
 
 const L = window.L;
 const $ = (sel) => document.querySelector(sel);
 const STATUS_ORDER = ['none', 'social', 'dead', 'site'];
+const LEVEL_ORDER = ['hot', 'warm', 'cold'];
+const NEW_DAYS = 14;
+const CHANGE_LABELS = { site_lost: 'Сайт пропал', site_gained: 'Сайт появился' };
 const PAGE = 150;
 const MAX_LIVE_SPAN = 0.35; // градусов: больше — слишком тяжёлый запрос для живой загрузки
 const PREFS_KEY = 'sitemap-prefs-v1';
@@ -13,17 +19,35 @@ const PREFS_KEY = 'sitemap-prefs-v1';
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const safeHref = (url) => (/^https?:\/\//i.test(url || '') ? esc(url) : '#');
 const fmt = (n) => n.toLocaleString('ru-RU');
+/** Дата вида «5 нояб. 2026 г.» из 'ГГГГ-ММ-ДД'; '' для некорректного значения. */
+const fmtDay = (day) => {
+  if (typeof day !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(day)) return '';
+  const d = new Date(day + 'T00:00:00');
+  return Number.isNaN(d.getTime()) ? '' : d.toLocaleDateString('ru-RU', { dateStyle: 'medium' });
+};
+/** Значок перспективности: цветная точка и балл. */
+const scoreBadge = (sc, withLabel = false) => {
+  const lv = LEVELS[sc.level];
+  return `<span class="score" style="--c:${lv.color}" title="Перспективность: ${esc(lv.label)}, ${sc.score} из 100"><i></i>${withLabel ? esc(lv.label) + ' · ' : ''}${sc.score}</span>`;
+};
 
 const leads = createLeadStore();
 let leadMap = leads.all();
 const leadStatusById = Object.fromEntries(STATUSES.map((s) => [s.id, s]));
 
+function emptyFilters() {
+  return {
+    q: '', statuses: new Set(), levels: new Set(), groups: new Set(), lead: 'any',
+    onlyPhone: false, hideBrands: false, onlyNew: false, withIssues: false, inView: false,
+  };
+}
+
 const state = {
-  places: new Map(), // id -> place (с вычисленными полями _status, _cat, _text)
+  places: new Map(), // id -> place (с вычисленными полями _status, _cat, _text, _score, _new, _issues)
   filtered: [],
   shown: PAGE,
   selectedId: null,
-  filters: { q: '', statuses: new Set(), groups: new Set(), lead: 'any', onlyPhone: false, hideBrands: false, inView: false },
+  filters: emptyFilters(),
   meta: null,
 };
 const markers = new Map();
@@ -75,8 +99,10 @@ legend.addTo(map);
 function makeIcon(place) {
   const lead = leadMap[place.id];
   const leadColor = lead && lead.status !== 'none' ? leadStatusById[lead.status]?.color : '';
+  // Сделанные сайты («мои работы») отмечены звездой.
+  const star = lead?.status === 'done' ? '<b class="pin-star" title="Сайт сделан">⭐</b>' : '';
   return L.divIcon({
-    html: `<div class="pin${leadColor ? ' lead' : ''}" style="--c:${SITE_STATUS[place._status].color}${leadColor ? `;--lead:${leadColor}` : ''}"><span>${place._cat.icon}</span></div>`,
+    html: `<div class="pin${leadColor ? ' lead' : ''}" style="--c:${SITE_STATUS[place._status].color}${leadColor ? `;--lead:${leadColor}` : ''}"><span>${place._cat.icon}</span></div>${star}`,
     className: '',
     iconSize: [26, 26],
     iconAnchor: [13, 24],
@@ -100,6 +126,10 @@ function prepare(place) {
   place._cat = classify(place.kind);
   place._text = [place.name, place.address, place.phone, place._cat.label, place.brand, place.website && hostOf(place.website)]
     .filter(Boolean).join(' ').toLowerCase();
+  place._score = leadScore(place, place._status);
+  place._new = isNew(place, NEW_DAYS);
+  // Проблемы сайта показываем только у работающих сайтов.
+  place._issues = place._status === 'site' ? knownIssues(place.siteIssues) : [];
   return place;
 }
 
@@ -115,6 +145,9 @@ function addPlaces(list) {
     // Результат автоматической проверки сайта переносим, если адрес сайта не поменялся.
     const old = state.places.get(raw.id);
     if (old && old.siteCheck && old.website === raw.website && !raw.siteCheck) raw.siteCheck = old.siteCheck;
+    if (old && old.siteIssues && old.website === raw.website && !raw.siteIssues) raw.siteIssues = old.siteIssues;
+    // Историю (когда появилось, когда менялся сайт) живые данные не знают — сохраняем прежнюю.
+    if (old) for (const key of ['added', 'changed', 'changeType']) if (old[key] !== undefined && raw[key] === undefined) raw[key] = old[key];
     state.places.set(raw.id, prepare(raw));
   }
   return added;
@@ -179,9 +212,12 @@ async function loadArea() {
 
 /* ---------- Фильтры ---------- */
 
-function matches(p, { skipStatus = false, skipGroup = false } = {}) {
+function matches(p, { skipStatus = false, skipGroup = false, skipLevel = false } = {}) {
   const f = state.filters;
   if (!skipStatus && f.statuses.size && !f.statuses.has(p._status)) return false;
+  if (!skipLevel && f.levels.size && !f.levels.has(p._score.level)) return false;
+  if (f.onlyNew && !p._new) return false;
+  if (f.withIssues && !p._issues.length) return false;
   if (!skipGroup && f.groups.size && !f.groups.has(p._cat.group)) return false;
   if (f.onlyPhone && !p.phone) return false;
   if (f.hideBrands && p.brand) return false;
@@ -194,23 +230,20 @@ function matches(p, { skipStatus = false, skipGroup = false } = {}) {
   return true;
 }
 
-const SORT_RANK = { none: 0, dead: 1, social: 2, site: 3 };
-
 function refresh({ keepPage = false } = {}) {
   const all = [...state.places.values()];
   const statusCounts = { none: 0, social: 0, dead: 0, site: 0 };
   const groupCounts = {};
+  const levelCounts = { hot: 0, warm: 0, cold: 0 };
   const filtered = [];
   for (const p of all) {
     if (matches(p, { skipStatus: true })) statusCounts[p._status]++;
+    if (matches(p, { skipLevel: true })) levelCounts[p._score.level]++;
     if (matches(p, { skipGroup: true })) groupCounts[p._cat.group] = (groupCounts[p._cat.group] || 0) + 1;
     if (matches(p)) filtered.push(p);
   }
-  // Сначала самые перспективные: без сайта и с телефоном.
-  filtered.sort((a, b) =>
-    SORT_RANK[a._status] - SORT_RANK[b._status] ||
-    (b.phone ? 1 : 0) - (a.phone ? 1 : 0) ||
-    a.name.localeCompare(b.name, 'ru'));
+  // Сначала самые перспективные: по баллу (js/score.js), затем по названию.
+  filtered.sort((a, b) => b._score.score - a._score.score || a.name.localeCompare(b.name, 'ru'));
   state.filtered = filtered;
   if (!keepPage) state.shown = PAGE;
 
@@ -218,7 +251,7 @@ function refresh({ keepPage = false } = {}) {
   cluster.addLayers(filtered.map(markerFor));
 
   renderStats(filtered);
-  renderChips(statusCounts, groupCounts);
+  renderChips(statusCounts, groupCounts, levelCounts);
   renderList();
   savePrefs();
 }
@@ -236,11 +269,15 @@ function renderStats(list) {
   $('#list-count').textContent = `Показано: ${fmt(list.length)} из ${fmt(state.places.size)}`;
 }
 
-function renderChips(statusCounts, groupCounts) {
+function renderChips(statusCounts, groupCounts, levelCounts) {
   const f = state.filters;
   $('#status-chips').innerHTML = STATUS_ORDER.map((s) => `
     <button class="chip" data-status="${s}" aria-pressed="${f.statuses.has(s)}" style="--c:${SITE_STATUS[s].color}">
       <span class="dot"></span>${SITE_STATUS[s].label}<span class="n">${fmt(statusCounts[s])}</span>
+    </button>`).join('');
+  $('#level-chips').innerHTML = LEVEL_ORDER.map((lv) => `
+    <button class="chip" data-level="${lv}" aria-pressed="${f.levels.has(lv)}" style="--c:${LEVELS[lv].color}" title="Балл от ${LEVELS[lv].min}">
+      <span class="dot"></span>${esc(LEVELS[lv].label)}<span class="n">${fmt(levelCounts[lv])}</span>
     </button>`).join('');
   $('#group-chips').innerHTML = GROUPS.filter((g) => groupCounts[g.id] || f.groups.has(g.id)).map((g) => `
     <button class="chip" data-group="${g.id}" aria-pressed="${f.groups.has(g.id)}">
@@ -258,11 +295,17 @@ function renderList() {
       const lead = leadMap[p.id];
       const ls = lead && lead.status !== 'none' ? leadStatusById[lead.status] : null;
       const sub = [p._cat.label, p.address, p.phone].filter(Boolean).join(' · ');
+      const done = lead?.status === 'done';
+      const tags =
+        (p._new ? '<span class="new-tag">новое</span> ' : '') +
+        (done && lead.url ? `<a class="work-link" href="${safeHref(lead.url)}" target="_blank" rel="noopener noreferrer" title="Открыть сделанный сайт">↗ ${esc(hostOf(lead.url) || 'сайт')}</a> · ` : '') +
+        (ls ? `<span class="lead-tag" style="--c:${ls.color}">● ${esc(ls.label)}</span> · ` : '');
       return `<li class="item${p.id === state.selectedId ? ' active' : ''}" data-id="${esc(p.id)}" style="--c:${SITE_STATUS[p._status].color}" tabindex="0">
         <span class="ico">${p._cat.icon}</span>
-        <span class="name">${esc(p.name)}</span>
+        <span class="name">${done ? '<span title="Сайт сделан">⭐</span> ' : ''}${esc(p.name)}</span>
+        ${scoreBadge(p._score)}
         <span class="badge">${SITE_STATUS[p._status].label}</span>
-        <span class="sub">${ls ? `<span class="lead-tag" style="--c:${ls.color}">● ${esc(ls.label)}</span> · ` : ''}${esc(sub)}</span>
+        <span class="sub">${tags}${esc(sub)}</span>
       </li>`;
     }).join('');
   }
@@ -301,6 +344,10 @@ function renderDetail(p) {
   if (p.address) rows.push(['Адрес', esc(p.address)]);
   if (p.hours) rows.push(['Часы', esc(p.hours)]);
   if (p.brand) rows.push(['Сеть', esc(p.brand)]);
+  if (p._new && fmtDay(p.added)) rows.push(['На карте', `с ${esc(fmtDay(p.added))}`]);
+  if (CHANGE_LABELS[p.changeType]) rows.push(['Изменение', esc([CHANGE_LABELS[p.changeType], fmtDay(p.changed)].filter(Boolean).join(' '))]);
+  const sc = p._score;
+  const isDone = lead.status === 'done';
 
   const osmType = { n: 'node', w: 'way', r: 'relation' }[p.id[0]];
   const osmLink = osmType && /^\d+$/.test(p.id.slice(1)) ? `<a href="https://www.openstreetmap.org/${osmType}/${p.id.slice(1)}" target="_blank" rel="noopener">OSM</a>` : '';
@@ -308,9 +355,21 @@ function renderDetail(p) {
   const el = $('#detail');
   el.innerHTML = `
     <button class="close" aria-label="Закрыть">×</button>
-    <h2>${esc(p.name)}</h2>
+    <h2><span id="done-star" title="Сайт сделан"${isDone ? '' : ' hidden'}>⭐ </span>${esc(p.name)}</h2>
     <div class="cat">${p._cat.icon} ${esc(p._cat.label)} · ${esc(group.label)}</div>
-    <span class="badge" style="--c:${st.color}">${st.label}</span>
+    <div class="tags">
+      <span class="badge" style="--c:${st.color}">${st.label}</span>
+      ${scoreBadge(sc, true)}
+      ${p._new ? '<span class="new-tag">новое</span>' : ''}
+    </div>
+    <div class="box">
+      <div class="box-title">Почему такой балл</div>
+      <ul>${sc.reasons.map((r) => `<li>${esc(r)}</li>`).join('')}</ul>
+    </div>
+    ${p._issues.length ? `<div class="box issues">
+      <div class="box-title">Проблемы сайта (автопроверка)</div>
+      <ul>${p._issues.map((id) => `<li>${esc(ISSUES[id].label)}</li>`).join('')}</ul>
+    </div>` : ''}
     <dl>${rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('')}</dl>
     <div class="links">
       <a href="https://yandex.ru/maps/?ll=${p.lon},${p.lat}&z=18&text=${q}" target="_blank" rel="noopener">Яндекс Карты</a>
@@ -320,6 +379,11 @@ function renderDetail(p) {
     </div>
     <label for="lead-status">Статус лида</label>
     <select id="lead-status">${STATUSES.map((s) => `<option value="${s.id}"${s.id === lead.status ? ' selected' : ''}>${esc(s.label)}</option>`).join('')}</select>
+    <div id="portfolio"${isDone ? '' : ' hidden'}>
+      <label for="lead-url">Ссылка на сделанный сайт</label>
+      <input id="lead-url" type="url" inputmode="url" placeholder="https://…" autocomplete="off" value="${esc(lead.url || '')}">
+      <div id="portfolio-link" class="hint"></div>
+    </div>
     <label for="lead-note">Заметка</label>
     <textarea id="lead-note" placeholder="С кем говорили, о чём договорились…">${esc(lead.note)}</textarea>
     <div class="links">
@@ -329,7 +393,29 @@ function renderDetail(p) {
   el.hidden = false;
 
   el.querySelector('.close').onclick = closeDetail;
-  el.querySelector('#lead-status').onchange = (e) => leads.set(p.id, { status: e.target.value });
+  // Блок «моя работа» виден только у лидов со статусом «Сайт сделан».
+  const syncPortfolio = () => {
+    const rec = leads.get(p.id);
+    const done = rec.status === 'done';
+    el.querySelector('#done-star').hidden = !done;
+    el.querySelector('#portfolio').hidden = !done;
+    el.querySelector('#portfolio-link').innerHTML = rec.url
+      ? `⭐ Моя работа: <a href="${safeHref(rec.url)}" target="_blank" rel="noopener noreferrer">${esc(hostOf(rec.url) || rec.url)}</a>`
+      : 'Появится в списке и в карточке как «моя работа».';
+  };
+  syncPortfolio();
+  el.querySelector('#lead-status').onchange = (e) => {
+    leads.set(p.id, { status: e.target.value });
+    syncPortfolio();
+  };
+  el.querySelector('#lead-url').onchange = (e) => {
+    try {
+      e.target.value = leads.set(p.id, { url: e.target.value }).url || '';
+      syncPortfolio();
+    } catch (err) {
+      toast(err.message, 5000);
+    }
+  };
   el.querySelector('#lead-note').onchange = (e) => leads.set(p.id, { note: e.target.value });
   el.querySelector('#copy-pitch').onclick = async () => {
     const text = buildPitch({ name: p.name, categoryLabel: p._cat.label, siteStatus: p._status });
@@ -370,7 +456,8 @@ function savePrefs() {
   const f = state.filters;
   try {
     localStorage.setItem(PREFS_KEY, JSON.stringify({
-      statuses: [...f.statuses], groups: [...f.groups], lead: f.lead, onlyPhone: f.onlyPhone, hideBrands: f.hideBrands,
+      statuses: [...f.statuses], levels: [...f.levels], groups: [...f.groups], lead: f.lead,
+      onlyPhone: f.onlyPhone, hideBrands: f.hideBrands, onlyNew: f.onlyNew, withIssues: f.withIssues,
     }));
   } catch { /* приватный режим — живём без сохранения */ }
 }
@@ -385,6 +472,9 @@ function loadPrefs() {
     f.lead = p.lead === 'tracked' || leadStatusById[p.lead] ? p.lead : 'any';
     f.onlyPhone = !!p.onlyPhone;
     f.hideBrands = !!p.hideBrands;
+    f.levels = new Set((Array.isArray(p.levels) ? p.levels : []).filter((lv) => LEVEL_ORDER.includes(lv)));
+    f.onlyNew = !!p.onlyNew;
+    f.withIssues = !!p.withIssues;
   } catch { /* повреждённые настройки игнорируем */ }
 }
 
@@ -395,6 +485,8 @@ function syncControls() {
   $('#only-phone').checked = f.onlyPhone;
   $('#hide-brands').checked = f.hideBrands;
   $('#in-view').checked = f.inView;
+  $('#only-new').checked = f.onlyNew;
+  $('#with-issues').checked = f.withIssues;
 }
 
 function toggle(set, value) {
@@ -457,6 +549,12 @@ function bind() {
     state.filters.statuses = only ? new Set() : new Set([btn.dataset.status]);
     refresh();
   });
+  $('#level-chips').addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-level]');
+    if (!btn) return;
+    toggle(state.filters.levels, btn.dataset.level);
+    refresh();
+  });
   $('#group-chips').addEventListener('click', (e) => {
     const btn = e.target.closest('[data-group]');
     if (!btn) return;
@@ -467,13 +565,16 @@ function bind() {
   $('#only-phone').addEventListener('change', (e) => { state.filters.onlyPhone = e.target.checked; refresh(); });
   $('#hide-brands').addEventListener('change', (e) => { state.filters.hideBrands = e.target.checked; refresh(); });
   $('#in-view').addEventListener('change', (e) => { state.filters.inView = e.target.checked; refresh(); });
+  $('#only-new').addEventListener('change', (e) => { state.filters.onlyNew = e.target.checked; refresh(); });
+  $('#with-issues').addEventListener('change', (e) => { state.filters.withIssues = e.target.checked; refresh(); });
   $('#reset-filters').addEventListener('click', () => {
-    Object.assign(state.filters, { q: '', statuses: new Set(), groups: new Set(), lead: 'any', onlyPhone: false, hideBrands: false, inView: false });
+    Object.assign(state.filters, emptyFilters());
     syncControls();
     refresh();
   });
 
   $('#list').addEventListener('click', (e) => {
+    if (e.target.closest('a')) return; // ссылка на сделанный сайт открывается сама
     const li = e.target.closest('.item');
     if (li) select(li.dataset.id);
   });
@@ -504,7 +605,13 @@ function bind() {
 
   $('#export-csv').addEventListener('click', () => {
     if (!state.filtered.length) return toast('Нечего выгружать — список пуст.');
-    const rows = state.filtered.map((p) => ({ ...p, categoryLabel: p._cat.label, siteStatusLabel: SITE_STATUS[p._status].label }));
+    const rows = state.filtered.map((p) => ({
+      ...p,
+      categoryLabel: p._cat.label,
+      siteStatusLabel: SITE_STATUS[p._status].label,
+      score: p._score.score,
+      siteIssueLabels: p._issues.map((id) => ISSUES[id].label),
+    }));
     downloadText(`zavedeniya-${new Date().toISOString().slice(0, 10)}.csv`, placesToCSV(rows, leads), 'text/csv;charset=utf-8');
     toast(`Выгружено строк: ${fmt(rows.length)}.`);
   });

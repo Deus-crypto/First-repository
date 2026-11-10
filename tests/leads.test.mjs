@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { STATUSES, createLeadStore, placesToCSV, buildPitch, downloadText } from '../js/leads.js';
+import { STATUSES, createLeadStore, placesToCSV, buildPitch, downloadText, normalizePortfolioUrl } from '../js/leads.js';
 
 const KEY = 'sitemap-leads-v1';
 
@@ -173,7 +173,7 @@ test('placesToCSV: BOM, header, CRLF and ";" separator', () => {
     [
       'Название', 'Категория', 'Сайт (статус)', 'Сайт', 'Соцсети', 'Телефон', 'Email',
       'Адрес', 'Часы работы', 'Сеть', 'Статус лида', 'Заметка', 'Широта', 'Долгота',
-      'Яндекс Карты', 'OSM ID',
+      'Яндекс Карты', 'OSM ID', 'Балл', 'Проблемы сайта',
     ]
       .map((h) => `"${h}"`)
       .join(';'),
@@ -221,6 +221,20 @@ test('placesToCSV: coordinates, yandex link, osm id, and lead columns when store
   assert.ok(withoutStore.includes(';"";"";'));
 });
 
+test('placesToCSV: score and site issues are the last two columns', () => {
+  const csv = placesToCSV([
+    { id: 'n1', name: 'Кафе', score: 85, siteIssueLabels: ['Нет HTTPS', 'Сайт-заглушка'] },
+    { id: 'n2', name: 'Бар', score: 0, siteIssueLabels: '=x' },
+    { id: 'n3', name: 'Без балла' },
+  ]);
+  const lines = csv.slice(1).split('\r\n');
+  assert.ok(lines[0].endsWith('"OSM ID";"Балл";"Проблемы сайта"'));
+  assert.ok(lines[1].endsWith('"n1";"85";"Нет HTTPS, Сайт-заглушка"'));
+  assert.ok(lines[2].endsWith(`"n2";"0";"'=x"`));
+  assert.ok(lines[3].endsWith('"n3";"";""'));
+  for (const line of lines.slice(0, 4)) assert.equal(line.split('";"').length, 18);
+});
+
 test('placesToCSV tolerates empty input and missing fields', () => {
   assert.equal(placesToCSV([]).split('\r\n').length, 2);
   assert.doesNotThrow(() => placesToCSV([{}]));
@@ -266,4 +280,68 @@ test('STATUSES ids are unique and cover the spec', () => {
     STATUSES.map((s) => s.id),
     ['none', 'planned', 'contacted', 'negotiation', 'in_progress', 'done', 'rejected'],
   );
+});
+
+test('normalizePortfolioUrl accepts only http(s) addresses', () => {
+  assert.equal(normalizePortfolioUrl(' https://example.com/work '), 'https://example.com/work');
+  assert.equal(normalizePortfolioUrl('http://example.com'), 'http://example.com/');
+  for (const bad of ['', '   ', 'example.com', 'javascript:alert(1)', 'ftp://example.com', 'https://a b.ru', 'https://', null, 5, {}]) {
+    assert.equal(normalizePortfolioUrl(bad), '', String(bad));
+  }
+});
+
+test('portfolio url: set, keep through other patches, clear', () => {
+  const storage = fakeStorage();
+  const store = createLeadStore(storage);
+  store.set('a', { status: 'done', url: ' https://example.com/work ' });
+  assert.equal(store.get('a').url, 'https://example.com/work');
+  store.set('a', { note: 'сдано' });
+  assert.equal(store.get('a').url, 'https://example.com/work');
+  assert.equal(createLeadStore(storage).get('a').url, 'https://example.com/work');
+  store.set('a', { url: '' });
+  assert.ok(!('url' in store.get('a')));
+  assert.equal(store.get('a').status, 'done');
+});
+
+test('portfolio url: invalid value throws TypeError and changes nothing', () => {
+  const store = createLeadStore(fakeStorage());
+  store.set('a', { status: 'done', url: 'https://example.com/' });
+  for (const bad of ['javascript:alert(1)', 'example.com', 'ftp://example.com/x']) {
+    assert.throws(() => store.set('a', { url: bad }), TypeError);
+  }
+  assert.equal(store.get('a').url, 'https://example.com/');
+});
+
+test('portfolio url: record is not deleted while url is set', () => {
+  const store = createLeadStore(fakeStorage());
+  store.set('a', { status: 'done', url: 'https://example.com/' });
+  store.set('a', { status: 'none', note: '' });
+  assert.equal(store.count(), 1);
+  assert.equal(store.get('a').url, 'https://example.com/');
+  store.set('a', { url: '' });
+  assert.equal(store.count(), 0);
+  assert.deepEqual(store.get('a'), { status: 'none', note: '', updated: null });
+});
+
+test('portfolio url: survives export/import, invalid url is dropped on import', () => {
+  const s1 = createLeadStore(fakeStorage());
+  s1.set('a', { status: 'done', url: 'https://example.com/a' });
+  s1.set('b', { status: 'planned' });
+  const s2 = createLeadStore(fakeStorage());
+  assert.equal(s2.importJSON(s1.exportJSON()), 2);
+  assert.deepEqual(s2.all(), s1.all());
+  assert.ok(!('url' in s2.get('b')));
+
+  const s3 = createLeadStore(fakeStorage());
+  const text = JSON.stringify({
+    leads: {
+      x: { status: 'done', note: '', updated: '2024-01-01T00:00:00.000Z', url: 'javascript:alert(1)' },
+      y: { status: 'none', note: '', updated: '2024-01-01T00:00:00.000Z', url: 'https://example.com/y' },
+      z: { status: 'none', note: '', updated: '2024-01-01T00:00:00.000Z', url: 42 },
+    },
+  });
+  assert.equal(s3.importJSON(text), 2);
+  assert.ok(!('url' in s3.get('x')));
+  assert.equal(s3.get('y').url, 'https://example.com/y');
+  assert.equal(s3.count(), 2);
 });

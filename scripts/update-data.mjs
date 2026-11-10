@@ -3,12 +3,15 @@
 // Запуск:  node scripts/update-data.mjs
 // Настройки — в config.json. Переменные окружения:
 //   OVERPASS_URL   — использовать только этот сервер Overpass
-//   CHECK_SITES=0  — пропустить проверку доступности сайтов
+//   CHECK_SITES=0  — пропустить проверку доступности сайтов (и аудит качества вместе с ней)
+//   AUDIT_SITES=0  — проверять только доступность, без аудита качества сайтов
 
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { buildQuery, fetchOverpass, normalizeResponse, siteStatus, OVERPASS_ENDPOINTS } from '../js/osm.js';
+import { mergeHistory, diffSummary, isNew } from '../js/history.js';
+import { auditSite } from './site-quality.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const CONFIG_FILE = path.join(ROOT, 'config.json');
@@ -64,28 +67,63 @@ export async function checkSite(url, fetchImpl = fetch) {
   }
 }
 
-async function checkSites(places, concurrency = 24) {
+/**
+ * Доступность и качество сайта одним запросом: аудит (auditSite) скачивает страницу,
+ * а мы подсматриваем за его запросом и выносим тот же осторожный вердикт, что и checkSite.
+ * @returns {Promise<{check: 'ok'|'dead'|'unknown', issues: string[]|null}>}
+ *   issues — id проблем, если сайт ответил успешно и отдал HTML; иначе null.
+ */
+export async function inspectSite(url, fetchImpl = fetch) {
+  let check = 'unknown';
+  const spy = async (target, init) => {
+    try {
+      const res = await fetchImpl(target, init);
+      check = res?.status === 404 || res?.status === 410 ? 'dead' : 'ok';
+      return res;
+    } catch (err) {
+      check = (err?.cause?.code || '') === 'ENOTFOUND' ? 'dead' : 'unknown';
+      throw err;
+    }
+  };
+  const result = await auditSite(url, spy);
+  return { check, issues: result.ok ? result.issues : null };
+}
+
+/**
+ * Проверяет сайты заведений (каждый адрес — один раз) и дописывает результат прямо в объекты:
+ * siteCheck = 'dead' — сайт однозначно не открывается (подтверждено повторной попыткой);
+ * siteIssues = [...] — найденные проблемы качества (только если они есть и audit включён).
+ */
+export async function checkSites(places, { concurrency = 24, audit = true, fetchImpl = fetch } = {}) {
   const targets = places.filter((p) => p.website);
   const byUrl = new Map();
+
+  async function inspect(url) {
+    const first = audit ? await inspectSite(url, fetchImpl) : { check: await checkSite(url, fetchImpl), issues: null };
+    if (first.check !== 'dead') return { dead: false, issues: first.issues };
+    // Одна повторная попытка, чтобы исключить случайный сбой DNS.
+    return { dead: (await checkSite(url, fetchImpl)) === 'dead', issues: null };
+  }
+
   let index = 0;
   let dead = 0;
+  let withIssues = 0;
   async function worker() {
     while (index < targets.length) {
       const place = targets[index++];
-      if (!byUrl.has(place.website)) byUrl.set(place.website, checkSite(place.website));
+      if (!byUrl.has(place.website)) byUrl.set(place.website, inspect(place.website));
       const result = await byUrl.get(place.website);
-      if (result === 'dead') {
-        // Одна повторная попытка, чтобы исключить случайный сбой DNS.
-        const again = await checkSite(place.website);
-        if (again === 'dead') {
-          place.siteCheck = 'dead';
-          dead++;
-        }
+      if (result.dead) {
+        place.siteCheck = 'dead';
+        dead++;
+      } else if (result.issues?.length) {
+        place.siteIssues = [...result.issues];
+        withIssues++;
       }
     }
   }
   await Promise.all(Array.from({ length: concurrency }, worker));
-  return { checked: targets.length, dead };
+  return { checked: targets.length, dead, withIssues };
 }
 
 async function main() {
@@ -113,37 +151,54 @@ async function main() {
     }
   }
 
-  const places = [...all.values()].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
-  if (!places.length) throw new Error('Overpass вернул пустой результат — данные не перезаписаны');
+  const fetched = [...all.values()].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  if (!fetched.length) throw new Error('Overpass вернул пустой результат — данные не перезаписаны');
   const prevCount = previous && !previous.demo ? previous.places?.length || 0 : 0;
-  if (prevCount && places.length < prevCount * 0.5) {
-    throw new Error(`Получено ${places.length} заведений против ${prevCount} раньше — похоже на сбой, данные не перезаписаны`);
+  if (prevCount && fetched.length < prevCount * 0.5) {
+    throw new Error(`Получено ${fetched.length} заведений против ${prevCount} раньше — похоже на сбой, данные не перезаписаны`);
   }
+
+  // История: дата первого появления заведения и дата, когда у него пропал или появился сайт.
+  // После демонстрационных данных (и при первом запуске) историю не датируем.
+  const prevIsDemo = !previous || !!previous.demo;
+  const places = mergeHistory(previous?.places, fetched, { prevIsDemo });
+  const diff = diffSummary(previous?.places, fetched, { prevIsDemo });
+  if (prevIsDemo) log('История изменений начнётся со следующего обновления: сравнивать пока не с чем.');
+  else log(`Изменения с прошлого обновления: новых заведений ${diff.added}, исчезло ${diff.removed}, сайт пропал у ${diff.siteLost}, сайт появился у ${diff.siteGained}`);
 
   const checkEnabled = config.checkSites !== false && process.env.CHECK_SITES !== '0';
+  const auditEnabled = checkEnabled && config.auditSites !== false && process.env.AUDIT_SITES !== '0';
   if (checkEnabled) {
-    log('Проверяю доступность сайтов…');
-    const { checked, dead } = await checkSites(places);
-    log(`  проверено ${checked}, не открываются: ${dead}`);
+    log(auditEnabled ? 'Проверяю доступность и качество сайтов…' : 'Проверяю доступность сайтов…');
+    const { checked, dead, withIssues } = await checkSites(places, { audit: auditEnabled });
+    log(`  проверено ${checked}, не открываются: ${dead}${auditEnabled ? `, с проблемами: ${withIssues}` : ''}`);
   }
 
-  const stats = { total: places.length, site: 0, social: 0, none: 0, dead: 0 };
-  for (const p of places) stats[siteStatus(p)]++;
+  const stats = { total: places.length, site: 0, social: 0, none: 0, dead: 0, issues: 0, new: 0 };
+  for (const p of places) {
+    stats[siteStatus(p)]++;
+    if (p.siteIssues?.length) stats.issues++;
+    if (isNew(p)) stats.new++;
+  }
 
-  // Если состав данных не изменился, оставляем прежнюю дату — так не будет пустых коммитов.
-  const same = previous && !previous.demo && JSON.stringify(previous.places) === JSON.stringify(places);
+  // Если данные не изменились, оставляем прежнюю дату и файл целиком — так не будет пустых коммитов.
+  // Счётчики сравниваем тоже: число «новых» меняется со временем и при тех же заведениях.
+  const same = !prevIsDemo &&
+    JSON.stringify(previous.places) === JSON.stringify(places) &&
+    JSON.stringify(previous.stats) === JSON.stringify(stats);
   const output = {
     generated: same ? previous.generated : new Date().toISOString(),
     source: 'OpenStreetMap (Overpass API)',
     license: 'ODbL — © участники OpenStreetMap',
     areas: config.areas.map(({ name, bbox }) => ({ name, bbox })),
     sitesChecked: checkEnabled,
+    sitesAudited: auditEnabled,
     stats,
     places,
   };
   await mkdir(path.dirname(DATA_FILE), { recursive: true });
   await writeFile(DATA_FILE, JSON.stringify(output) + '\n');
-  log(`Готово: ${stats.total} заведений (с сайтом ${stats.site}, только соцсети ${stats.social}, без сайта ${stats.none}, сайт не открывается ${stats.dead})`);
+  log(`Готово: ${stats.total} заведений (с сайтом ${stats.site}, только соцсети ${stats.social}, без сайта ${stats.none}, сайт не открывается ${stats.dead}; сайтов с проблемами ${stats.issues}, новых за 14 дней ${stats.new})`);
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
