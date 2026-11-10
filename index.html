@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Карта заведений: с сайтом и без</title>
+  <meta name="description" content="Интерактивная самообновляемая карта заведений: у кого есть сайт, у кого только соцсети, а у кого сайта нет.">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📍</text></svg>">
+  <link rel="stylesheet" href="vendor/leaflet/leaflet.css">
+  <link rel="stylesheet" href="vendor/markercluster/MarkerCluster.css">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <button id="toggle-panel" class="icon-btn" aria-label="Показать или скрыть список" title="Список и фильтры">☰</button>
+    <h1>Карта заведений <span class="muted">— с сайтом и без</span></h1>
+    <form id="geo-form" class="geo" role="search">
+      <input id="geo-input" type="search" placeholder="Город или адрес…" aria-label="Перейти к городу или адресу" autocomplete="off">
+      <button type="submit" title="Найти на карте">Найти</button>
+    </form>
+    <button id="load-area" class="primary" title="Загрузить свежие данные OpenStreetMap для видимой части карты">⟳ Загрузить эту область</button>
+  </header>
+
+  <div id="banner" class="banner" hidden></div>
+
+  <main class="layout">
+    <aside id="panel" class="panel">
+      <section class="stats" id="stats" aria-label="Статистика"></section>
+
+      <section class="filters" aria-label="Фильтры">
+        <input id="search" type="search" placeholder="Поиск по названию, адресу, телефону…" aria-label="Поиск по заведениям">
+
+        <div class="filter-title">Сайт</div>
+        <div class="chips" id="status-chips"></div>
+
+        <div class="filter-title">Категория</div>
+        <div class="chips" id="group-chips"></div>
+
+        <div class="filter-title">Мои лиды</div>
+        <select id="lead-filter" aria-label="Фильтр по статусу лида"></select>
+
+        <div class="checks">
+          <label><input type="checkbox" id="only-phone"> только с телефоном</label>
+          <label><input type="checkbox" id="hide-brands"> скрыть сетевые</label>
+          <label><input type="checkbox" id="in-view"> только в видимой области</label>
+        </div>
+
+        <div class="actions">
+          <button id="export-csv" title="Скачать отфильтрованный список в CSV (открывается в Excel)">⬇ CSV</button>
+          <button id="export-leads" title="Сохранить мои статусы и заметки в файл">⬇ Лиды</button>
+          <button id="import-leads" title="Загрузить статусы и заметки из файла">⬆ Лиды</button>
+          <button id="reset-filters" title="Сбросить все фильтры">Сбросить</button>
+          <input id="import-file" type="file" accept="application/json,.json" hidden>
+        </div>
+      </section>
+
+      <div class="list-head"><span id="list-count"></span><span id="updated" class="muted"></span></div>
+      <ul id="list" class="list"></ul>
+      <button id="more" class="more" hidden>Показать ещё</button>
+
+      <footer class="foot">
+        Данные: © участники <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> (ODbL).
+        «Нет сайта» означает, что сайт не указан в OpenStreetMap — перед обращением проверьте вручную.
+      </footer>
+    </aside>
+
+    <div id="map" class="map" aria-label="Карта"></div>
+
+    <section id="detail" class="detail" hidden aria-live="polite"></section>
+  </main>
+
+  <div id="toast" class="toast" hidden role="status"></div>
+
+  <script src="vendor/leaflet/leaflet.js"></script>
+  <script src="vendor/markercluster/leaflet.markercluster.js"></script>
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>
